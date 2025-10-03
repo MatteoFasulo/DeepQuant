@@ -6,7 +6,7 @@
 
 """
 Script to fix the CCTTrueQuantized ONNX model by duplicating shared constants.
-This resolves the issue where a single Floor constant (onnx::Floor_772) is shared
+This resolves the issue where a single Floor constant is shared
 across multiple bias quantization operations.
 """
 
@@ -18,16 +18,17 @@ import onnx
 from onnx import helper
 
 
-def fix_shared_constants(model_path, output_path):
+def fix_shared_constants(model_path, output_path, node_name="Floor_633"):
     """Fix shared constants in ONNX model by creating unique copies."""
     print(f"Loading ONNX model from: {model_path}")
     model = onnx.load(model_path)
 
     graph = model.graph
+    full_name = f"onnx::{node_name}" if not node_name.startswith("onnx::") else node_name
 
     shared_floor_tensor = None
     for initializer in graph.initializer:
-        if initializer.name == "onnx::Floor_772":
+        if initializer.name == full_name:
             shared_floor_tensor = initializer
             break
 
@@ -52,7 +53,7 @@ def fix_shared_constants(model_path, output_path):
 
     new_initializers = []
     for i, node in enumerate(floor_nodes):
-        unique_name = f"Floor_772_unique_{i}_{node.name.replace('/', '_')}"
+        unique_name = f"{node_name}_unique_{i}_{node.name.replace('/', '_')}"
 
         new_tensor = helper.make_tensor(
             name=unique_name,
@@ -116,6 +117,11 @@ def main():
         required=True,
         help="Path to output fixed ONNX model",
     )
+    parser.add_argument(
+        "--node",
+        required=True,
+        help="Name of the node to fix",
+    )
 
     args = parser.parse_args()
 
@@ -123,19 +129,12 @@ def main():
         print(f"Error: Input file does not exist: {args.input}")
         return 1
 
-    success = fix_shared_constants(args.input, args.output)
+    success = fix_shared_constants(args.input, args.output, node_name=args.node)
 
     if success:
         print("Successfully fixed the ONNX model!")
         print(f"Original model: {args.input}")
         print(f"Fixed model: {args.output}")
-
-        # FBRANCASI: Replace the original model with the fixed one
-        backup_path = args.input + ".backup"
-        print(f"Creating backup: {backup_path}")
-        os.rename(args.input, backup_path)
-        os.rename(args.output, args.input)
-        print("Replaced original model with fixed version")
 
         return 0
     else:
