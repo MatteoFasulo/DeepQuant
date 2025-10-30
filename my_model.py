@@ -64,6 +64,7 @@ QUANT_SCALE_PARAM = {
 CONV_BIAS = True  # Whether convolutional layers should have bias terms
 LINEAR_BIAS = True  # Whether linear layers should have bias terms
 
+
 def split_qkv_weight(weight: torch.Tensor):
     """
     Split a qkv weight into q,k,v according to shape.
@@ -79,8 +80,8 @@ def split_qkv_weight(weight: torch.Tensor):
     if out_dim % 3 == 0:
         h = out_dim // 3
         q = weight[0:h, :].clone()
-        k = weight[h:2*h, :].clone()
-        v = weight[2*h:3*h, :].clone()
+        k = weight[h : 2 * h, :].clone()
+        v = weight[2 * h : 3 * h, :].clone()
         return q, k, v
     # Case B: concatenated along input cols: (H, 3*D)  (less common)
     if in_dim % 3 == 0:
@@ -88,11 +89,14 @@ def split_qkv_weight(weight: torch.Tensor):
         # transpose -> split -> transpose back
         wt_t = weight.t().contiguous()  # shape (in_dim, out_dim)
         q_t = wt_t[0:h, :].contiguous()
-        k_t = wt_t[h:2*h, :].contiguous()
-        v_t = wt_t[2*h:3*h, :].contiguous()
+        k_t = wt_t[h : 2 * h, :].contiguous()
+        v_t = wt_t[2 * h : 3 * h, :].contiguous()
         # transpose back to original orientation
         return q_t.t().contiguous(), k_t.t().contiguous(), v_t.t().contiguous()
-    raise ValueError(f"Weight shape {weight.shape} is not a 3-way concatenation along rows or cols.")
+    raise ValueError(
+        f"Weight shape {weight.shape} is not a 3-way concatenation along rows or cols."
+    )
+
 
 def split_qkv_bias(bias: torch.Tensor):
     """
@@ -105,13 +109,16 @@ def split_qkv_bias(bias: torch.Tensor):
     n = bias.shape[0]
     if n % 3 == 0:
         h = n // 3
-        return bias[0:h].clone(), bias[h:2*h].clone(), bias[2*h:3*h].clone()
+        return bias[0:h].clone(), bias[h : 2 * h].clone(), bias[2 * h : 3 * h].clone()
     raise ValueError(f"Bias length {n} is not divisible by 3.")
 
-def convert_state_dict_qkv_to_qkv_separate(state_dict: dict,
-                                           qkv_key_pattern=re.compile(r"(.*)\.qkv\.(weight|bias)$"),
-                                           separate_template="{prefix}.q.{param}",
-                                           key_replace_prefix=None):
+
+def convert_state_dict_qkv_to_qkv_separate(
+    state_dict: dict,
+    qkv_key_pattern=re.compile(r"(.*)\.qkv\.(weight|bias)$"),
+    separate_template="{prefix}.q.{param}",
+    key_replace_prefix=None,
+):
     """
     Convert state_dict keys that contain '.qkv.weight' or '.qkv.bias' into
     separate '.q.weight', '.k.weight', '.v.weight' (and same for biases).
@@ -144,7 +151,9 @@ def convert_state_dict_qkv_to_qkv_separate(state_dict: dict,
         bias = state_dict.get(bias_key, None)
 
         if weight is None:
-            raise KeyError(f"Expected weight at {weight_key} but it is missing in provided state_dict.")
+            raise KeyError(
+                f"Expected weight at {weight_key} but it is missing in provided state_dict."
+            )
 
         # split
         try:
@@ -175,6 +184,7 @@ def convert_state_dict_qkv_to_qkv_separate(state_dict: dict,
 
     return new_sd
 
+
 def describe_latency(latencies_seconds):
     arr = np.array(latencies_seconds)
     if arr.size == 0:
@@ -186,11 +196,16 @@ def describe_latency(latencies_seconds):
         "p50_ms": float(np.percentile(arr, 50) * 1000.0),
         "p90_ms": float(np.percentile(arr, 90) * 1000.0),
         "p99_ms": float(np.percentile(arr, 99) * 1000.0),
-        "throughput_samples_per_sec": float(1.0 / arr.mean()) if arr.mean() > 0 else float("inf"),
+        "throughput_samples_per_sec": (
+            float(1.0 / arr.mean()) if arr.mean() > 0 else float("inf")
+        ),
     }
     return stats
 
-def evaluate_model_torch(model, dataloader, device="cpu", warmup_batches=5, name="model"):
+
+def evaluate_model_torch(
+    model, dataloader, device="cpu", warmup_batches=5, name="model"
+):
     model.to(device)
     model.eval()
     total_correct = 0
@@ -210,7 +225,9 @@ def evaluate_model_torch(model, dataloader, device="cpu", warmup_batches=5, name
 
     # Real eval
     with torch.no_grad():
-        for _, (inputs, targets) in tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Evaluating {name}"):
+        for _, (inputs, targets) in tqdm(
+            enumerate(dataloader), total=len(dataloader), desc=f"Evaluating {name}"
+        ):
             # inputs: (batch, channels?, ...) adjust if needed
             batch_size = inputs.shape[0]
             inputs = inputs.to(device)
@@ -240,7 +257,9 @@ def evaluate_model_torch(model, dataloader, device="cpu", warmup_batches=5, name
     return acc, latency_stats
 
 
-def evaluate_model_onnx(onnx_path, dataloader, device="cpu", warmup_batches=5, name="onnx"):
+def evaluate_model_onnx(
+    onnx_path, dataloader, device="cpu", warmup_batches=5, name="onnx"
+):
     providers = ["CPUExecutionProvider"]
     ort_session = ort.InferenceSession(onnx_path, providers=providers)
     input_name = ort_session.get_inputs()[0].name
@@ -258,7 +277,9 @@ def evaluate_model_onnx(onnx_path, dataloader, device="cpu", warmup_batches=5, n
     total_correct = 0
     total_samples = 0
     latencies = []
-    for _, (inputs, targets) in tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Evaluating {name} (ONNX)"):
+    for _, (inputs, targets) in tqdm(
+        enumerate(dataloader), total=len(dataloader), desc=f"Evaluating {name} (ONNX)"
+    ):
         batch_size = inputs.shape[0]
         ort_inputs = {input_name: inputs.unsqueeze(1).numpy()}
         t0 = time.perf_counter()
@@ -284,6 +305,7 @@ def evaluate_model_onnx(onnx_path, dataloader, device="cpu", warmup_batches=5, n
     logger.info("%s (ONNX) latency stats: %s", name, latency_stats)
     return acc, latency_stats
 
+
 def injectCustomForwards(
     model: nn.Module,
     exampleInput: torch.Tensor,
@@ -299,7 +321,7 @@ def injectCustomForwards(
     transformations = [
         MHATransformation(),
         LinearTransformation(),
-        #ActivationTransformation(),  # FBRANCASI: Commented out for CCT compatibility
+        # ActivationTransformation(),  # FBRANCASI: Commented out for CCT compatibility
     ]
 
     executor = TransformationExecutor(transformations, debug=debug, tracer=tracer)
@@ -450,7 +472,13 @@ def apply_qkv_fix(model, node, reshape_user):
 # keep a module-level cache to avoid duplicate dequant nodes
 _dequant_cache = {}
 
-def apply_matmul_fix(model: torch.fx.GraphModule, producer_node: torch.fx.Node, matmul_node: torch.fx.Node, arg_index: int):
+
+def apply_matmul_fix(
+    model: torch.fx.GraphModule,
+    producer_node: torch.fx.Node,
+    matmul_node: torch.fx.Node,
+    arg_index: int,
+):
     """
     Insert QuantIdentity after producer_node, then update matmul_node.args[arg_index]
     to use the new dequant node. Reuse dequant node for same producer if previously created.
@@ -490,6 +518,7 @@ def apply_matmul_fix(model: torch.fx.GraphModule, producer_node: torch.fx.Node, 
 
     return dequant_node
 
+
 def prepare_my_model(model, verbose: bool = False) -> nn.Module:
     model = model.eval()
 
@@ -523,15 +552,21 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
     # FBRANCASI: Apply matmul fixes
     print(f"Applying {len(matmul_fixes)} matmul fixes...")
     for matmul_node in matmul_fixes:
-        logger.debug(f"Fixing matmul: {matmul_node.name}; args = {[getattr(a,'name',str(a)) for a in matmul_node.args]}")
-        for i, arg in enumerate(list(matmul_node.args)):   # <-- list() to copy
+        logger.debug(
+            f"Fixing matmul: {matmul_node.name}; args = {[getattr(a,'name',str(a)) for a in matmul_node.args]}"
+        )
+        for i, arg in enumerate(list(matmul_node.args)):  # <-- list() to copy
             if isinstance(arg, torch.fx.Node):
                 # skip if this arg is already a QuantIdentity/dequant we inserted earlier
                 if "dequant_for_matmul" in getattr(arg, "name", ""):
-                    logger.debug(f"  skipping arg {i} ({arg.name}) — already dequantized")
+                    logger.debug(
+                        f"  skipping arg {i} ({arg.name}) — already dequantized"
+                    )
                     continue
                 # Insert dequant after the producer (arg) and update matmul arg
-                apply_matmul_fix(model=model, producer_node=arg, matmul_node=matmul_node, arg_index=i)
+                apply_matmul_fix(
+                    model=model, producer_node=arg, matmul_node=matmul_node, arg_index=i
+                )
 
     model.recompile()
     model.graph.lint()
@@ -610,7 +645,7 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
     }
 
     quant_act_map = {
-        #nn.ReLU: (
+        # nn.ReLU: (
         #    qnn.QuantReLU,
         #    {
         #        "act_quant": Int8ActPerTensorFloat,
@@ -618,7 +653,7 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
         #        "bit_width": 8,
         #        **QUANT_SCALE_PARAM,
         #    },
-        #),
+        # ),
     }
 
     quant_identity_map = {
@@ -828,24 +863,24 @@ if __name__ == "__main__":
     )
 
     # load weights
-    weights = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    state_dict = weights["state_dict"]
-    logger.info("Loaded state dict keys: %d", len(state_dict.keys()))
-
-    pretrained_params = {
-        k.replace("model.", ""): v
-        for k, v in state_dict.items()
-        if k.startswith("model.")
-    }
-    pretrained_params = {k.replace("patch_embed.", ""): v for k, v in pretrained_params.items()}
-
-    # Convert QKV shared weights to separate Q,K,V weights
-    pretrained_params = convert_state_dict_qkv_to_qkv_separate(pretrained_params)
-    encoder.load_state_dict(pretrained_params, strict=True if encoder.n_layer == 8 else False)
-    model_head.load_state_dict(
-        {k.replace("model_head.", ""): v for k, v in state_dict.items() if k.startswith("model_head.")},
-        strict=True,
-    )
+    # weights = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    # state_dict = weights["state_dict"]
+    # logger.info("Loaded state dict keys: %d", len(state_dict.keys()))
+    #
+    # pretrained_params = {
+    #    k.replace("model.", ""): v
+    #    for k, v in state_dict.items()
+    #    if k.startswith("model.")
+    # }
+    # pretrained_params = {k.replace("patch_embed.", ""): v for k, v in pretrained_params.items()}
+    #
+    ## Convert QKV shared weights to separate Q,K,V weights
+    # pretrained_params = convert_state_dict_qkv_to_qkv_separate(pretrained_params)
+    # encoder.load_state_dict(pretrained_params, strict=True if encoder.n_layer == 8 else False)
+    # model_head.load_state_dict(
+    #    {k.replace("model_head.", ""): v for k, v in state_dict.items() if k.startswith("model_head.")},
+    #    strict=True,
+    # )
 
     encoder.eval()
     model_head.eval()
@@ -855,7 +890,7 @@ if __name__ == "__main__":
             super().__init__()
             self.encoder = encoder
             self.head = head
-        
+
         def forward(self, x):
             x = self.encoder(x)
             x = self.head(x)
@@ -866,11 +901,15 @@ if __name__ == "__main__":
     model.eval()
 
     # Prepare dataloaders
-    calib_dset = EMGDataset(args.calibration_data, finetune=True)
-    calib_loader = torch.utils.data.DataLoader(calib_dset, batch_size=32, shuffle=False, pin_memory=True)
-
-    test_dset = EMGDataset(args.test_data, finetune=True)
-    test_loader = torch.utils.data.DataLoader(test_dset, batch_size=1, shuffle=False, pin_memory=True)
+    # calib_dset = EMGDataset(args.calibration_data, finetune=True)
+    # calib_loader = torch.utils.data.DataLoader(
+    #    calib_dset, batch_size=32, shuffle=False, pin_memory=True
+    # )
+    #
+    # test_dset = EMGDataset(args.test_data, finetune=True)
+    # test_loader = torch.utils.data.DataLoader(
+    #    test_dset, batch_size=1, shuffle=False, pin_memory=True
+    # )
 
     # Export FP32 ONNX for reference
     onnx_fp32_path = "Tests/ONNX/model.onnx"
@@ -880,7 +919,13 @@ if __name__ == "__main__":
     # FP32 evaluation (ONNXRuntime)
     if args.verbose:
         logger.info("Evaluating FP32 (ONNXRuntime) model...")
-        fp32_acc, fp32_latency = evaluate_model_onnx(onnx_fp32_path, test_loader, device=device, warmup_batches=5, name="FP32-ONNX")
+        fp32_acc, fp32_latency = evaluate_model_onnx(
+            onnx_fp32_path,
+            test_loader,
+            device=device,
+            warmup_batches=5,
+            name="FP32-ONNX",
+        )
 
     # Prepare quantized model
     logger.info("Preparing quantized model...")
@@ -891,13 +936,17 @@ if __name__ == "__main__":
         logger.info("Calibrating quantized model (PTQ) ...")
         with torch.no_grad():
             with calibration_mode(quantized_model):
-                for (x, _) in tqdm(calib_loader, desc="Calibrating", total=len(calib_loader)):
+                for x, _ in tqdm(
+                    calib_loader, desc="Calibrating", total=len(calib_loader)
+                ):
                     x = x.unsqueeze(1).to(device)
                     quantized_model(x)
 
             # Apply bias correction if available
             with bias_correction_mode(quantized_model):
-                for (x, _) in tqdm(calib_loader, desc="Bias Correction", total=len(calib_loader)):
+                for x, _ in tqdm(
+                    calib_loader, desc="Bias Correction", total=len(calib_loader)
+                ):
                     x = x.unsqueeze(1).to(device)
                     quantized_model(x)
 
@@ -931,8 +980,16 @@ if __name__ == "__main__":
     if args.verbose:
         # INT8 evaluation (ONNXRuntime)
         onnx_int8_path = "Tests/ONNX/network.onnx"
-        logger.info("Evaluating ONNX model (path=%s) using ONNXRuntime...", onnx_int8_path)
-        int8_acc_onnx, int8_latency_onnx = evaluate_model_onnx(onnx_int8_path, test_loader, device=device, warmup_batches=5, name="INT8-ONNX")
+        logger.info(
+            "Evaluating ONNX model (path=%s) using ONNXRuntime...", onnx_int8_path
+        )
+        int8_acc_onnx, int8_latency_onnx = evaluate_model_onnx(
+            onnx_int8_path,
+            test_loader,
+            device=device,
+            warmup_batches=5,
+            name="INT8-ONNX",
+        )
 
         # Summary
         print("\n\n" + "=" * 90)
@@ -940,7 +997,12 @@ if __name__ == "__main__":
         print("=" * 90)
         print(
             "{:<22} | {:<10} | {:<10} | {:<10} | {:<10} | {:<10}".format(
-                "Model (Backend)", "Accuracy", "Mean (ms)", "P90 (ms)", "P99 (ms)", "Throughput"
+                "Model (Backend)",
+                "Accuracy",
+                "Mean (ms)",
+                "P90 (ms)",
+                "P99 (ms)",
+                "Throughput",
             )
         )
         print("-" * 90)
@@ -950,7 +1012,7 @@ if __name__ == "__main__":
                 f"{lat['mean_ms']:.2f}",
                 f"{lat['p90_ms']:.2f}",
                 f"{lat['p99_ms']:.2f}",
-                f"{lat['throughput_samples_per_sec']:.1f}"
+                f"{lat['throughput_samples_per_sec']:.1f}",
             )
 
         fp32_mean, fp32_p90, fp32_p99, fp32_thr = fmt_latency(fp32_latency)
@@ -963,7 +1025,12 @@ if __name__ == "__main__":
         )
         print(
             "{:<22} | {:<10.4f} | {:<10} | {:<10} | {:<10} | {:<10}".format(
-                "INT8 (ONNXRuntime)", int8_acc_onnx, int8_mean, int8_p90, int8_p99, int8_thr
+                "INT8 (ONNXRuntime)",
+                int8_acc_onnx,
+                int8_mean,
+                int8_p90,
+                int8_p99,
+                int8_thr,
             )
         )
         print("=" * 90 + "\n\n")
