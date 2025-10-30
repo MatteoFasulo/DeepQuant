@@ -51,7 +51,9 @@ class RotaryPositionalEmbeddings(nn.Module):
             self.base
             ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
         )
+        seq_idx = torch.arange(max_seq_len, dtype=torch.float32)
         self.register_buffer("theta", theta, persistent=False)
+        self.register_buffer("seq_idx", seq_idx, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -68,28 +70,21 @@ class RotaryPositionalEmbeddings(nn.Module):
             - n_h: num heads
             - h_d: head dim
         """
-        # input tensor has shape [b, s, n_h, h_d]
-        seq_len = x.size(1)
-
-        seq_idx = torch.arange(seq_len, dtype=self.theta.dtype, device=x.device)
-
+        b, s, n_h, h_d = 1, 400, 3, self.dim  # x.shape
+        seq_idx = self.seq_idx[:s]  # shape: [s]
         # Outer product of theta and position index
         # idx_theta shape: [b, s, dim // 2] or [s, dim // 2]
-        idx_theta = torch.einsum("...i, j -> ...ij", seq_idx, self.theta).float()
+        idx_theta = torch.einsum("...i, j -> ...ij", seq_idx, self.theta)
 
         # rope_cache includes both the cos and sin components
         # rope_cache shape: [b, s, dim // 2, 2] or [s, dim // 2, 2]
         rope_cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        rope_cache = rope_cache.view(b, s, 1, h_d // 2, 2)
 
         # reshape input; the last dimension is used for computing the output.
         # Cast to float to match the reference implementation
         # tensor has shape [b, s, n_h, h_d // 2, 2]
-        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-
-        # reshape the cache for broadcasting
-        # tensor has shape [b, s, 1, h_d // 2, 2] if packed samples,
-        # otherwise has shape [1, s, 1, h_d // 2, 2]
-        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
+        xshaped = x.reshape(b, s, n_h, h_d // 2, 2)
 
         # tensor has shape [b, s, n_h, h_d // 2, 2]
         x_out = torch.stack(
@@ -160,50 +155,65 @@ class RoPEAttention(nn.Module):
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
         self.num_heads, self.dim = num_heads, dim
         self.hd = dim // num_heads
-        self.fused_attn = False
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # Separate projections
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.rope = RotaryPositionalEmbeddings(dim=self.hd, max_seq_len=1024, base=10_000)
+        self.rope = RotaryPositionalEmbeddings(dim=self.hd, max_seq_len=1000, base=10_000)
 
     def forward(self, x, attn_mask=None):
-        B, N, D = x.shape  # [batch_size, total_number_tokens, embedding_dimension]
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.hd)
-        q, k, v = torch.chunk(qkv, 3, dim=2)   # each: [B,N,1,heads,hd]
-        q = q.squeeze(2)                        # [B,N,heads,hd]
-        k = k.squeeze(2)
-        v = v.squeeze(2)
+        """
+        x: [B, N, D]
+        attn_mask: [B, N] or [B, N, N] (mask values: 0 for masked/padded positions, 1 for valid)
+        """
+        B, N, D = x.shape
 
-        # Apply RoPE on [B, N, heads, hd]
-        #q = self.rope(q)
-        #k = self.rope(k)
+        # Project and reshape into [B, N, heads, hd]
+        q = self.q(x).view(B, N, self.num_heads, self.hd)
+        k = self.k(x).view(B, N, self.num_heads, self.hd)
+        v = self.v(x).view(B, N, self.num_heads, self.hd)
+
+        # Optionally apply RoPE on Q and K while still in [B, N, heads, hd]
+        #if self.rope is not None:
+        #    q = self.rope(q)
+        #    k = self.rope(k)
 
         # Permute to attention layout [B, heads, N, hd]
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        scale_factor = 1 / (self.hd ** 0.5)
-        q = q * scale_factor
-        attn = q @ k.transpose(-2, -1)
+        # Scaled dot-product attention
+        scale = self.hd ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale  # [B, heads, N, N]
 
         if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(1).expand(B, self.num_heads, N, N)
-            attn = attn.masked_fill(attn_mask == 0, float("-inf"))
+            # Normalize mask shape to [B, N, N] (if user passed [B, N] row mask)
+            if attn_mask.dim() == 2:
+                # attn_mask: [B, N] -> broadcast to [B, N, N] where rows of valid tokens are 1
+                attn_mask = attn_mask.unsqueeze(1).expand(B, N, N)
+            # expand to [B, heads, N, N]
+            attn_mask_exp = attn_mask.unsqueeze(1).expand(B, self.num_heads, N, N).to(attn.device)
+            attn = attn.masked_fill(attn_mask_exp == 0, float("-inf"))
+        else:
+            attn_mask_exp = None
 
         attn = attn.softmax(dim=-1)
 
-        if attn_mask is not None:
-            # Check for padded tensors and set them to zero after softmax
-            fully_padded_idx = attn_mask.sum(dim=-1, keepdim=True).eq(0)
+        if attn_mask_exp is not None:
+            # For rows that were fully padded (sum == 0), set attention to zero
+            fully_padded_idx = attn_mask_exp.sum(dim=-1, keepdim=True).eq(0)  # [B, heads, N, 1]
             attn = attn.masked_fill(fully_padded_idx, 0.0)
 
         attn = self.attn_drop(attn)
-        x = attn @ v
 
+        x = attn @ v                      # [B, heads, N, hd]
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -261,7 +271,8 @@ class CustomAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), attn_mask)
-        x = x + self.mlp(self.norm2(x))
+        x = self.norm2(x)
+        x = x + self.mlp(x)
         return x
 
 class MlpClassificationHead(nn.Module):
@@ -271,6 +282,7 @@ class MlpClassificationHead(nn.Module):
         num_classes: int = 10,
         reduction: str = "concat",
         in_chans: int = 16,
+        bias: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -281,7 +293,7 @@ class MlpClassificationHead(nn.Module):
         # after reduction, feature_dim → either embed_dim or in_chans*embed_dim
         feat_dim = embed_dim if reduction == "mean" else in_chans * embed_dim
 
-        self.classifier = nn.Linear(feat_dim, num_classes)
+        self.classifier = nn.Linear(feat_dim, num_classes, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -294,19 +306,18 @@ class MlpClassificationHead(nn.Module):
         C = self.in_chans
         p = N // C
 
+        x = x.reshape(B, C, p, D)
         if self.reduction == "mean":
-            x = x.reshape(B, C, p, D)
             x = x.mean(dim=1)  # (B, num_patches, embed_dim)
         elif self.reduction == "concat":
             # Reshape to (B, num_patches, embed_dim * in_chans)
-            x = x.reshape(B, C, p, D)
             x = x.permute(0, 2, 1, 3)
             x = x.reshape(B, p, C * D)
         else:
             raise ValueError(f"Unknown reduction method: {self.reduction}")
 
         # pool across patches
-        x = x.mean(dim=1)  # (B, feat_dim)
+        x = x.mean(dim=1)
 
         # apply classifier
         logits = self.classifier(x)

@@ -13,6 +13,7 @@ python -m onnxruntime.tools.symbolic_shape_infer --input Tests/ONNX/network.onnx
 
 import argparse
 import logging
+import re
 import sys
 import time
 from typing import Tuple
@@ -61,6 +62,118 @@ QUANT_SCALE_PARAM = {
     # "scaling_stats_op": StatsOp.MAX,
 }
 CONV_BIAS = True  # Whether convolutional layers should have bias terms
+LINEAR_BIAS = True  # Whether linear layers should have bias terms
+
+def split_qkv_weight(weight: torch.Tensor):
+    """
+    Split a qkv weight into q,k,v according to shape.
+    Returns tuple (q, k, v).
+    Handles both common layouts:
+      - concatenated along output dim: weight.shape[0] == 3 * hidden
+      - concatenated along input dim:  weight.shape[1] == 3 * hidden  (we transpose to split)
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"Expected 2D Linear weight, got shape {tuple(weight.shape)}")
+    out_dim, in_dim = weight.shape
+    # Case A: concatenated along output rows: (3*H, D)
+    if out_dim % 3 == 0:
+        h = out_dim // 3
+        q = weight[0:h, :].clone()
+        k = weight[h:2*h, :].clone()
+        v = weight[2*h:3*h, :].clone()
+        return q, k, v
+    # Case B: concatenated along input cols: (H, 3*D)  (less common)
+    if in_dim % 3 == 0:
+        h = in_dim // 3
+        # transpose -> split -> transpose back
+        wt_t = weight.t().contiguous()  # shape (in_dim, out_dim)
+        q_t = wt_t[0:h, :].contiguous()
+        k_t = wt_t[h:2*h, :].contiguous()
+        v_t = wt_t[2*h:3*h, :].contiguous()
+        # transpose back to original orientation
+        return q_t.t().contiguous(), k_t.t().contiguous(), v_t.t().contiguous()
+    raise ValueError(f"Weight shape {weight.shape} is not a 3-way concatenation along rows or cols.")
+
+def split_qkv_bias(bias: torch.Tensor):
+    """
+    Split qkv bias into q,k,v. bias must be 1D.
+    """
+    if bias is None:
+        return None, None, None
+    if bias.ndim != 1:
+        raise ValueError(f"Expected 1D bias, got {tuple(bias.shape)}")
+    n = bias.shape[0]
+    if n % 3 == 0:
+        h = n // 3
+        return bias[0:h].clone(), bias[h:2*h].clone(), bias[2*h:3*h].clone()
+    raise ValueError(f"Bias length {n} is not divisible by 3.")
+
+def convert_state_dict_qkv_to_qkv_separate(state_dict: dict,
+                                           qkv_key_pattern=re.compile(r"(.*)\.qkv\.(weight|bias)$"),
+                                           separate_template="{prefix}.q.{param}",
+                                           key_replace_prefix=None):
+    """
+    Convert state_dict keys that contain '.qkv.weight' or '.qkv.bias' into
+    separate '.q.weight', '.k.weight', '.v.weight' (and same for biases).
+    - state_dict: original state dict (dict of tensors)
+    - qkv_key_pattern: regex to find qkv keys. by default matches '<prefix>.qkv.weight' and '<prefix>.qkv.bias'
+    - separate_template: how to name output keys (not commonly changed)
+    - key_replace_prefix: optional function to alter prefix names (not required)
+    Returns: new_state_dict
+    """
+    new_sd = {}
+    handled_keys = set()
+
+    for key, val in state_dict.items():
+        m = qkv_key_pattern.match(key)
+        if not m:
+            # copy other params unchanged
+            new_sd[key] = val
+            continue
+
+        prefix = m.group(1)  # part before '.qkv.weight' or '.qkv.bias'
+
+        if key in handled_keys:
+            continue
+
+        # retrieve weight and bias (bias may be missing)
+        weight_key = f"{prefix}.qkv.weight"
+        bias_key = f"{prefix}.qkv.bias"
+
+        weight = state_dict.get(weight_key, None)
+        bias = state_dict.get(bias_key, None)
+
+        if weight is None:
+            raise KeyError(f"Expected weight at {weight_key} but it is missing in provided state_dict.")
+
+        # split
+        try:
+            q_w, k_w, v_w = split_qkv_weight(weight)
+        except Exception as e:
+            raise RuntimeError(f"Error splitting {weight_key}: {e}")
+
+        # split bias if present
+        if bias is not None:
+            try:
+                q_b, k_b, v_b = split_qkv_bias(bias)
+            except Exception as e:
+                raise RuntimeError(f"Error splitting bias {bias_key}: {e}")
+        else:
+            q_b = k_b = v_b = None
+
+        # build new keys and insert
+        for name, w, b in (("q", q_w, q_b), ("k", k_w, k_b), ("v", v_w, v_b)):
+            wkey = f"{prefix}.{name}.weight"  # user said they expect blocks.X.attn.q.weight etc.
+            new_sd[wkey] = w
+            if b is not None:
+                bkey = f"{prefix}.{name}.bias"
+                new_sd[bkey] = b
+
+        handled_keys.add(weight_key)
+        if bias is not None:
+            handled_keys.add(bias_key)
+
+    return new_sd
 
 def describe_latency(latencies_seconds):
     arr = np.array(latencies_seconds)
@@ -389,24 +502,26 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
     # FBRANCASI: Fix 1, Find transpose -> add patterns
     transpose_fixes = find_transpose_add(model, verbose=verbose)
     # FBRANCASI: Fix 2, Find QKV -> reshape patterns
-    #qkv_fixes = find_qkv_reshape(model, verbose=verbose)
+    qkv_fixes = find_qkv_reshape(model, verbose=verbose)
     # FBRANCASI: Fix 3, Find matmul operations that need dequantization
-    #matmul_fixes = find_matmul_dequantize(model, verbose=verbose)
+    matmul_fixes = find_matmul_dequantize(model, verbose=verbose)
+
+    print("\n=== APPLYING GRAPH MODIFICATIONS ===")
 
     # FBRANCASI: Apply transpose fixes
-    logger.debug(f"\nApplying {len(transpose_fixes)} transpose fixes...")
+    print(f"Applying {len(transpose_fixes)} transpose fixes...")
     for node, user in transpose_fixes:
         logger.debug(f"  Fixing: {node.name} -> {user.name}")
         apply_transpose_fix(model, node, user)
 
     # FBRANCASI: Apply QKV fixes
-    logger.debug(f"\nApplying {len(qkv_fixes)} QKV fixes...")
+    print(f"Applying {len(qkv_fixes)} QKV fixes...")
     for node, reshape_user in qkv_fixes:
         logger.debug(f"  Fixing: {node.name} -> {reshape_user.name}")
         apply_qkv_fix(model, node, reshape_user)
 
     # FBRANCASI: Apply matmul fixes
-    logger.debug(f"\nApplying {len(matmul_fixes)} matmul fixes...")
+    print(f"Applying {len(matmul_fixes)} matmul fixes...")
     for matmul_node in matmul_fixes:
         logger.debug(f"Fixing matmul: {matmul_node.name}; args = {[getattr(a,'name',str(a)) for a in matmul_node.args]}")
         for i, arg in enumerate(list(matmul_node.args)):   # <-- list() to copy
@@ -486,7 +601,7 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
                 "weight_quant": Int8WeightPerTensorFloat,
                 "output_quant": Int8ActPerTensorFloat,
                 "bias_quant": Int32Bias,
-                "bias": True,
+                "bias": LINEAR_BIAS,
                 "return_quant_tensor": True,
                 "output_bit_width": 8,
                 **QUANT_SCALE_PARAM,
@@ -494,7 +609,17 @@ def prepare_my_model(model, verbose: bool = False) -> nn.Module:
         ),
     }
 
-    quant_act_map = {}
+    quant_act_map = {
+        #nn.ReLU: (
+        #    qnn.QuantReLU,
+        #    {
+        #        "act_quant": Int8ActPerTensorFloat,
+        #        "return_quant_tensor": True,
+        #        "bit_width": 8,
+        #        **QUANT_SCALE_PARAM,
+        #    },
+        #),
+    }
 
     quant_identity_map = {
         "signed": (
@@ -684,7 +809,7 @@ if __name__ == "__main__":
         patch_size=20,
         in_chans=16,
         embed_dim=192,
-        n_layer=3,
+        n_layer=2,
         n_head=3,
         mlp_ratio=4,
         qkv_bias=True,
@@ -695,10 +820,11 @@ if __name__ == "__main__":
         conv_bias=CONV_BIAS,
     )
     model_head = MlpClassificationHead(
-        embed_dim=192, 
-        num_classes=7, 
-        reduction="concat", 
-        in_chans=16
+        embed_dim=192,
+        num_classes=7,
+        reduction="concat",
+        in_chans=16,
+        bias=LINEAR_BIAS,
     )
 
     # load weights
@@ -713,7 +839,9 @@ if __name__ == "__main__":
     }
     pretrained_params = {k.replace("patch_embed.", ""): v for k, v in pretrained_params.items()}
 
-    encoder.load_state_dict(pretrained_params, strict=False)
+    # Convert QKV shared weights to separate Q,K,V weights
+    pretrained_params = convert_state_dict_qkv_to_qkv_separate(pretrained_params)
+    encoder.load_state_dict(pretrained_params, strict=True if encoder.n_layer == 8 else False)
     model_head.load_state_dict(
         {k.replace("model_head.", ""): v for k, v in state_dict.items() if k.startswith("model_head.")},
         strict=True,
@@ -727,6 +855,7 @@ if __name__ == "__main__":
             super().__init__()
             self.encoder = encoder
             self.head = head
+        
         def forward(self, x):
             x = self.encoder(x)
             x = self.head(x)
@@ -748,9 +877,10 @@ if __name__ == "__main__":
     torch.onnx.export(model, (sample_input,), onnx_fp32_path, opset_version=17)
     logger.info("Exported FP32 ONNX to %s", onnx_fp32_path)
 
-    # FP32 evaluation (PyTorch)
-    logger.info("Evaluating FP32 (PyTorch) model...")
-    fp32_acc, fp32_latency = evaluate_model_torch(model, test_loader, device=device, warmup_batches=5, name="FP32-PyTorch")
+    # FP32 evaluation (ONNXRuntime)
+    if args.verbose:
+        logger.info("Evaluating FP32 (ONNXRuntime) model...")
+        fp32_acc, fp32_latency = evaluate_model_onnx(onnx_fp32_path, test_loader, device=device, warmup_batches=5, name="FP32-ONNX")
 
     # Prepare quantized model
     logger.info("Preparing quantized model...")
@@ -798,15 +928,45 @@ if __name__ == "__main__":
         importlib.reload(DeepQuant.Export)
         importlib.reload(DeepQuant.Export)
 
-    # INT8 evaluation (ONNXRuntime)
-    onnx_int8_path = "Tests/ONNX/network.onnx"
-    logger.info("Evaluating ONNX model (path=%s) using ONNXRuntime...", onnx_int8_path)
-    int8_acc_onnx, int8_latency_onnx = evaluate_model_onnx(onnx_int8_path, test_loader, device=device, warmup_batches=5, name="INT8-ONNX")
+    if args.verbose:
+        # INT8 evaluation (ONNXRuntime)
+        onnx_int8_path = "Tests/ONNX/network.onnx"
+        logger.info("Evaluating ONNX model (path=%s) using ONNXRuntime...", onnx_int8_path)
+        int8_acc_onnx, int8_latency_onnx = evaluate_model_onnx(onnx_int8_path, test_loader, device=device, warmup_batches=5, name="INT8-ONNX")
 
-    # Summary
-    logger.info("=== SUMMARY ===")
-    logger.info("FP32 (PyTorch): accuracy=%.4f, latency=%s", fp32_acc, fp32_latency)
-    logger.info("INT8 (ONNXRuntime): accuracy=%.4f, latency=%s", int8_acc_onnx, int8_latency_onnx)
+        # Summary
+        print("\n\n" + "=" * 90)
+        print("{:^90}".format("EVALUATION SUMMARY"))
+        print("=" * 90)
+        print(
+            "{:<22} | {:<10} | {:<10} | {:<10} | {:<10} | {:<10}".format(
+                "Model (Backend)", "Accuracy", "Mean (ms)", "P90 (ms)", "P99 (ms)", "Throughput"
+            )
+        )
+        print("-" * 90)
+
+        def fmt_latency(lat):
+            return (
+                f"{lat['mean_ms']:.2f}",
+                f"{lat['p90_ms']:.2f}",
+                f"{lat['p99_ms']:.2f}",
+                f"{lat['throughput_samples_per_sec']:.1f}"
+            )
+
+        fp32_mean, fp32_p90, fp32_p99, fp32_thr = fmt_latency(fp32_latency)
+        int8_mean, int8_p90, int8_p99, int8_thr = fmt_latency(int8_latency_onnx)
+
+        print(
+            "{:<22} | {:<10.4f} | {:<10} | {:<10} | {:<10} | {:<10}".format(
+                "FP32 (ONNXRuntime)", fp32_acc, fp32_mean, fp32_p90, fp32_p99, fp32_thr
+            )
+        )
+        print(
+            "{:<22} | {:<10.4f} | {:<10} | {:<10} | {:<10} | {:<10}".format(
+                "INT8 (ONNXRuntime)", int8_acc_onnx, int8_mean, int8_p90, int8_p99, int8_thr
+            )
+        )
+        print("=" * 90 + "\n\n")
 
     # Optionally, print per-output debug differences on a single sample (like you did before)
     with torch.no_grad():
