@@ -911,13 +911,13 @@ if __name__ == "__main__":
     #    test_dset, batch_size=1, shuffle=False, pin_memory=True
     # )
 
-    # Export FP32 ONNX for reference
-    onnx_fp32_path = "Tests/ONNX/model.onnx"
-    torch.onnx.export(model, (sample_input,), onnx_fp32_path, opset_version=17)
-    logger.info("Exported FP32 ONNX to %s", onnx_fp32_path)
-
-    # FP32 evaluation (ONNXRuntime)
     if args.verbose:
+        # Export FP32 ONNX for reference
+        onnx_fp32_path = "Tests/ONNX/model.onnx"
+        torch.onnx.export(model, (sample_input,), onnx_fp32_path, opset_version=17)
+        logger.info("Exported FP32 ONNX to %s", onnx_fp32_path)
+
+        # FP32 evaluation (ONNXRuntime)
         logger.info("Evaluating FP32 (ONNXRuntime) model...")
         fp32_acc, fp32_latency = evaluate_model_onnx(
             onnx_fp32_path,
