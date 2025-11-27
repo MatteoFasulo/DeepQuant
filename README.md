@@ -17,6 +17,12 @@ pip install -e .
 
 ### EMG Transformer
 
+First, you will need to clone the repository starting from the `emg-transformer` branch:
+
+```bash
+git clone --branch emg-transformer https://github.com/MatteoFasulo/DeepQuant.git
+```
+
 To use the EMG Transformer model, the main script is `my_model.py`.
 
 You will need to pass the required arguments (e.g., ckpt path) to run the script. An example command line is as follows:
