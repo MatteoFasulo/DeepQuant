@@ -17,13 +17,18 @@ pip install -e .
 
 ### EMG Transformer
 
-To use the EMG Transformer model, the main script is `my_model.py`. You can run it with:
+To use the EMG Transformer model, the main script is `my_model.py`.
+
+You will need to pass the required arguments (e.g., ckpt path) to run the script. An example command line is as follows:
 
 ```bash
-python my_model.py
+python my_model.py --ckpt path/to/checkpoint.ckpt
 ```
 
 and it will apply pre-quantization, quantization, and post-quantization optimizations to the EMG Transformer model. You can have a look at the script, it incorporate additional procedures to load pre-trained weights, perform static quantization with calibration data and verify the performances with test data under both FP32 and INT8 precision using ONNX Runtime.
+
+In order to perform calibration, you can provide a path to a calibration data file with `--calibration_data path/to/calib_data.h5` argument together with test data file with `--test_data path/to/test_data.h5` argument.
+> **Note**: Calibration is enabled only if the `--apply_calibration` flag is provided so make sure to include it if you want to perform calibration.
 
 Pre-quantization optimizations are largely inspired by the one of CCT applying Transpose-Add fusions, QKV fixes and adding dequant nodes before matmuls. Not all of them will be applied for EMG Transformer due to differences in architecture with respect to CCT.
 
@@ -46,6 +51,8 @@ python -m onnxruntime.tools.symbolic_shape_infer --input Tests/ONNX/network.onnx
 which will be applied as in the previous case **in-place** overwriting the input model producing an updated model with correct shapes.
 
 The final ONNX model together with input and output test data can be found in `Tests/ONNX/` folder.
+
+> **Note**: You can enable verbose output by adding the `--verbose` flag to the command line.
 
 ## Running Tests
 
