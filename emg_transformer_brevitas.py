@@ -497,8 +497,7 @@ class CustomAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), attn_mask)
-        x = self.norm2(x)
-        x = x + self.mlp(x)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
